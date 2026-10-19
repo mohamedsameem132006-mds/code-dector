@@ -70,11 +70,11 @@ export default function DatabaseViewerPage() {
               Database Explorer
             </h2>
             <span className="text-xs px-2.5 py-0.5 rounded-full bg-indigo-500/10 text-indigo-500 font-mono font-medium border border-indigo-500/20">
-              codesense_db
+              Cloud Firestore
             </span>
           </div>
           <p className={`text-sm ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-            Live inspection of persisted records in MySQL 8.0 with real queries.
+            Live inspection of persisted collections in Firebase Cloud Firestore.
           </p>
         </div>
 
@@ -154,7 +154,7 @@ export default function DatabaseViewerPage() {
           {tableLoading ? (
             <div className="py-16 text-center space-y-3">
               <div className="w-8 h-8 border-2 border-indigo-500/20 border-t-indigo-500 rounded-full animate-spin mx-auto" />
-              <p className="text-xs text-slate-400">Querying MySQL table `{selectedTable}`...</p>
+              <p className="text-xs text-slate-400">Querying Firestore collection `{selectedTable}`...</p>
             </div>
           ) : filteredRows.length === 0 ? (
             <div className="py-16 text-center space-y-2">
