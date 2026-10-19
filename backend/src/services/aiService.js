@@ -82,62 +82,84 @@ async function callGroq({ code, language, explanationLanguage }) {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error('GROQ_API_KEY is not configured');
 
-  const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+  const candidateModels = [
+    process.env.GROQ_MODEL,
+    'openai/gpt-oss-120b',
+    'qwen/qwen3.8-27b',
+    'openai/gpt-oss-20b',
+    'llama-3.3-70b-versatile',
+    'llama-3.1-8b-instant'
+  ].filter(Boolean);
+
   const url = 'https://api.groq.com/openai/v1/chat/completions';
   const promptText = `LANGUAGE: ${language}\nTARGET EXPLANATION LANGUAGE: ${explanationLanguage === 'ta' ? 'Tamil (தமிழ்) & English' : 'English'}\n\nSOURCE CODE TO ANALYZE:\n\`\`\`${language}\n${code}\n\`\`\``;
 
-  for (let attempt = 0; attempt <= 2; attempt++) {
-    if (attempt > 0) await delay(Math.min(1000 * Math.pow(2, attempt), 4000));
+  let lastError = null;
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 35000);
+  for (const model of candidateModels) {
+    for (let attempt = 0; attempt <= 1; attempt++) {
+      if (attempt > 0) await delay(Math.min(1000 * Math.pow(2, attempt), 3000));
 
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: promptText }
-          ],
-          temperature: 0.2,
-          response_format: { type: 'json_object' }
-        }),
-        signal: controller.signal
-      });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 35000);
 
-      clearTimeout(timeout);
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: 'system', content: SYSTEM_PROMPT },
+              { role: 'user', content: promptText }
+            ],
+            temperature: 0.2,
+            response_format: { type: 'json_object' }
+          }),
+          signal: controller.signal
+        });
 
-      if (response.status === 401 || response.status === 403) {
-        throw new Error('Groq authentication failed. Please verify GROQ_API_KEY.');
+        clearTimeout(timeout);
+
+        if (response.status === 401 || response.status === 403) {
+          throw new Error('Groq authentication failed. Please verify GROQ_API_KEY.');
+        }
+
+        if (response.status === 404) {
+          const text = await response.text();
+          lastError = new Error(`Groq model ${model} not available: ${text.substring(0, 100)}`);
+          break; // Try next model
+        }
+
+        if (response.status === 429 || (response.status >= 500 && response.status <= 504)) {
+          lastError = new Error(`Groq returned status ${response.status}`);
+          if (attempt < 1) continue;
+          break;
+        }
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Groq error (${response.status}): ${text.substring(0, 150)}`);
+        }
+
+        const data = await response.json();
+        const content = data.choices?.[0]?.message?.content;
+        return parseJsonFromAi(content, code);
+      } catch (err) {
+        clearTimeout(timeout);
+        lastError = err;
+        if (attempt < 1 && (err.name === 'AbortError' || err.message.includes('status 5') || err.message.includes('status 429'))) {
+          continue;
+        }
+        break;
       }
-
-      if (response.status === 429 || (response.status >= 500 && response.status <= 504)) {
-        if (attempt < 2) continue;
-        throw new Error(`Groq returned status ${response.status}`);
-      }
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Groq error (${response.status}): ${text.substring(0, 150)}`);
-      }
-
-      const data = await response.json();
-      const content = data.choices?.[0]?.message?.content;
-      return parseJsonFromAi(content, code);
-    } catch (err) {
-      clearTimeout(timeout);
-      if (attempt < 2 && (err.name === 'AbortError' || err.message.includes('status 5') || err.message.includes('status 429'))) {
-        continue;
-      }
-      throw err;
     }
   }
+
+  throw lastError || new Error('Failed to communicate with Groq across available models');
 }
 
 async function callGemini({ code, language, explanationLanguage }) {
