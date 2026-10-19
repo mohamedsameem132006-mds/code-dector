@@ -122,6 +122,13 @@ async function callServerlessAnalyze({ code, language, explanationLanguage }) {
 
         clearTimeout(timeout);
 
+        const contentType = response.headers.get('content-type') || '';
+        // If server returns HTML (like index.html rewrite), it means function wasn't invoked
+        if (contentType.includes('text/html')) {
+          lastError = new Error(`Endpoint ${endpoint} returned HTML instead of JSON`);
+          break; // Try next endpoint
+        }
+
         if (response.status === 404) {
           // Try next endpoint path
           break;
@@ -142,6 +149,9 @@ async function callServerlessAnalyze({ code, language, explanationLanguage }) {
         const resData = await response.json();
         if (resData.success && resData.data) {
           return resData.data;
+        }
+        if (resData.issues || resData.summary) {
+          return resData;
         }
       } catch (err) {
         clearTimeout(timeout);
@@ -164,54 +174,73 @@ async function callDirectGeminiFallback({ code, language, explanationLanguage })
     throw new Error('AI analysis is temporarily unavailable. Please try again later.');
   }
 
-  const model = CLIENT_GEMINI_MODEL;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${CLIENT_GEMINI_KEY}`;
+  const candidateModels = [
+    import.meta.env.VITE_AI_MODEL,
+    'gemini-3.5-flash',
+    'gemini-3.8-flash',
+    'gemini-2.5-flash'
+  ].filter(Boolean);
+
   const promptText = `LANGUAGE: ${language}\nTARGET EXPLANATION LANGUAGE: ${explanationLanguage === 'ta' ? 'Tamil (தமிழ்) & English' : 'English'}\n\nSOURCE CODE TO ANALYZE:\n\`\`\`${language}\n${code}\n\`\`\``;
+  let lastError = null;
 
-  for (let attempt = 0; attempt <= 2; attempt++) {
-    if (attempt > 0) await delay(Math.min(1000 * Math.pow(2, attempt), 3000));
+  for (const model of candidateModels) {
+    for (let attempt = 0; attempt <= 1; attempt++) {
+      if (attempt > 0) await delay(Math.min(1000 * Math.pow(2, attempt), 2000));
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 35000);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 35000);
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${CLIENT_GEMINI_KEY}`;
 
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [
-            { role: 'user', parts: [{ text: `${SYSTEM_PROMPT}\n\n${promptText}` }] }
-          ],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            temperature: 0.2
-          }
-        }),
-        signal: controller.signal
-      });
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [
+              { role: 'user', parts: [{ text: `${SYSTEM_PROMPT}\n\n${promptText}` }] }
+            ],
+            generationConfig: {
+              responseMimeType: 'application/json',
+              temperature: 0.2
+            }
+          }),
+          signal: controller.signal
+        });
 
-      clearTimeout(timeout);
+        clearTimeout(timeout);
 
-      if (response.status === 503 || response.status === 429) {
-        if (attempt < 2) continue;
-        throw new Error('AI service is temporarily busy. Please retry in a few moments.');
+        if (response.status === 404) {
+          // Model deprecated or not found for key, try next model
+          break;
+        }
+
+        if (response.status === 503 || response.status === 429) {
+          lastError = new Error('AI service is temporarily busy. Please retry in a few moments.');
+          if (attempt < 1) continue;
+          break; // Try next model candidate
+        }
+
+        if (!response.ok) {
+          const errText = await response.text();
+          lastError = new Error(`AI analysis service unavailable (${response.status})`);
+          break;
+        }
+
+        const data = await response.json();
+        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!rawText) throw new Error('AI returned empty response');
+        return parseJsonFromAi(rawText, code);
+      } catch (err) {
+        clearTimeout(timeout);
+        lastError = err;
+        if (attempt < 1 && (err.name === 'AbortError' || err.message?.includes('503'))) continue;
+        break;
       }
-
-      if (!response.ok) {
-        throw new Error(`AI analysis service unavailable (${response.status})`);
-      }
-
-      const data = await response.json();
-      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      return parseJsonFromAi(rawText, code);
-    } catch (err) {
-      clearTimeout(timeout);
-      if (attempt < 2 && (err.name === 'AbortError' || err.message?.includes('503'))) continue;
-      throw err;
     }
   }
 
-  throw new Error('AI analysis is temporarily unavailable. Please try again later.');
+  throw lastError || new Error('AI analysis is temporarily unavailable. Please try again later.');
 }
 
 export const apiService = {
