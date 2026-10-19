@@ -125,7 +125,11 @@ export default function WorkspacePage() {
       }
     } catch (err) {
       console.error(err);
-      setErrorMsg(err.response?.data?.message || err.message || 'Analysis request failed.');
+      let userFriendlyMsg = err.response?.data?.message || err.message || 'Analysis request failed.';
+      if (userFriendlyMsg.includes('503') || userFriendlyMsg.includes('high demand') || userFriendlyMsg.includes('temporarily unavailable')) {
+        userFriendlyMsg = 'AI analysis is temporarily unavailable. Please try again later.';
+      }
+      setErrorMsg(userFriendlyMsg);
     } finally {
       setIsAnalyzing(false);
     }
@@ -140,7 +144,7 @@ export default function WorkspacePage() {
             Code Analysis Workspace
           </h2>
           <p className={`text-sm ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-            Paste source code or upload files. Gemini 3.8 Flash will audit syntax, logic, security, and teach in Tamil or English.
+            Paste source code or upload files. High-speed AI audits syntax, logic, security, and teaches in Tamil or English.
           </p>
         </div>
 
@@ -178,7 +182,7 @@ export default function WorkspacePage() {
             {isAnalyzing ? (
               <>
                 <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                Analyzing with Gemini...
+                Auditing Code with AI...
               </>
             ) : (
               <>

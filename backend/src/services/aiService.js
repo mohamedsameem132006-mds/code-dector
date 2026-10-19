@@ -1,10 +1,8 @@
 const config = require('../config/env');
 
 /**
- * Gemini LLM Provider Service
- * Analyzes source code, discovers syntax/logic/security/runtime bugs,
- * produces corrected code, generates dual English/Tamil explanations,
- * and maintains strict structural schema.
+ * AI Provider Service (Backend)
+ * Supports Groq as Primary and Gemini as Fallback
  */
 
 const SYSTEM_PROMPT = `You are CodeSense AI, an expert static analysis engine, security auditor, and master coding instructor.
@@ -40,89 +38,191 @@ CRITICAL RULES:
 4. If no errors are detected, issues can be empty ([]), corrected_code should be identical to the original, and explain in teaching notes that the code is syntactically sound.
 5. Return ONLY the JSON object. Do not wrap in markdown \`\`\`json or add conversational text.`;
 
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseJsonFromAi(rawText, originalCode) {
+  if (!rawText || typeof rawText !== 'string') {
+    throw new Error('AI returned empty response');
+  }
+
+  let clean = rawText.trim();
+  clean = clean.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+
+  const firstBrace = clean.indexOf('{');
+  const lastBrace = clean.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    clean = clean.substring(firstBrace, lastBrace + 1);
+  }
+
+  const parsed = JSON.parse(clean);
+
+  return {
+    summary: parsed.summary || 'Code analysis completed.',
+    issues: Array.isArray(parsed.issues) ? parsed.issues.map(iss => ({
+      category: ['syntax', 'type', 'logic', 'runtime', 'security', 'style', 'performance'].includes(iss.category) ? iss.category : 'logic',
+      severity: ['critical', 'error', 'warning', 'info'].includes(iss.severity) ? iss.severity : 'warning',
+      line_number: parseInt(iss.line_number, 10) || 1,
+      column_number: parseInt(iss.column_number, 10) || 1,
+      message: String(iss.message || 'Suspicious construct detected'),
+      affected_code: String(iss.affected_code || ''),
+      explanation_en: String(iss.explanation_en || 'Issue observed in source code.'),
+      explanation_ta: String(iss.explanation_ta || 'மூலக் குறியீட்டில் பிழை அல்லது சந்தேகம் காணப்படுகிறது.'),
+      suggested_fix: String(iss.suggested_fix || 'Review and refactor this section.'),
+      verification_status: 'ai_suggestion'
+    })) : [],
+    corrected_code: parsed.corrected_code || originalCode,
+    teaching_notes_en: parsed.teaching_notes_en || 'Review clean code principles.',
+    teaching_notes_ta: parsed.teaching_notes_ta || 'குறியீட்டின் தரத்தை மேம்படுத்த பரிந்துரைக்கப்பட்ட மாற்றங்களைச் சரிபார்க்கவும்.'
+  };
+}
+
+async function callGroq({ code, language, explanationLanguage }) {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error('GROQ_API_KEY is not configured');
+
+  const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+  const url = 'https://api.groq.com/openai/v1/chat/completions';
+  const promptText = `LANGUAGE: ${language}\nTARGET EXPLANATION LANGUAGE: ${explanationLanguage === 'ta' ? 'Tamil (தமிழ்) & English' : 'English'}\n\nSOURCE CODE TO ANALYZE:\n\`\`\`${language}\n${code}\n\`\`\``;
+
+  for (let attempt = 0; attempt <= 2; attempt++) {
+    if (attempt > 0) await delay(Math.min(1000 * Math.pow(2, attempt), 4000));
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 35000);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'user', content: promptText }
+          ],
+          temperature: 0.2,
+          response_format: { type: 'json_object' }
+        }),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeout);
+
+      if (response.status === 401 || response.status === 403) {
+        throw new Error('Groq authentication failed. Please verify GROQ_API_KEY.');
+      }
+
+      if (response.status === 429 || (response.status >= 500 && response.status <= 504)) {
+        if (attempt < 2) continue;
+        throw new Error(`Groq returned status ${response.status}`);
+      }
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Groq error (${response.status}): ${text.substring(0, 150)}`);
+      }
+
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content;
+      return parseJsonFromAi(content, code);
+    } catch (err) {
+      clearTimeout(timeout);
+      if (attempt < 2 && (err.name === 'AbortError' || err.message.includes('status 5') || err.message.includes('status 429'))) {
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+async function callGemini({ code, language, explanationLanguage }) {
+  const apiKey = process.env.AI_API_KEY || process.env.GEMINI_API_KEY || config.ai.apiKey;
+  if (!apiKey) throw new Error('AI_API_KEY is not configured');
+
+  const model = process.env.AI_MODEL || config.ai.model || 'gemini-2.0-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const promptText = `LANGUAGE: ${language}\nTARGET EXPLANATION LANGUAGE: ${explanationLanguage === 'ta' ? 'Tamil (தமிழ்) & English' : 'English'}\n\nSOURCE CODE TO ANALYZE:\n\`\`\`${language}\n${code}\n\`\`\``;
+
+  for (let attempt = 0; attempt <= 2; attempt++) {
+    if (attempt > 0) await delay(Math.min(1000 * Math.pow(2, attempt), 4000));
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 35000);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [
+            { role: 'user', parts: [{ text: `${SYSTEM_PROMPT}\n\n${promptText}` }] }
+          ],
+          generationConfig: {
+            responseMimeType: 'application/json',
+            temperature: 0.2
+          }
+        }),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeout);
+
+      if (response.status === 401 || response.status === 403) {
+        throw new Error('Gemini authentication failed.');
+      }
+
+      if (response.status === 429 || (response.status >= 500 && response.status <= 504)) {
+        if (attempt < 2) continue;
+        throw new Error(`Gemini returned status ${response.status}`);
+      }
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Gemini error (${response.status}): ${text.substring(0, 150)}`);
+      }
+
+      const data = await response.json();
+      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      return parseJsonFromAi(rawText, code);
+    } catch (err) {
+      clearTimeout(timeout);
+      if (attempt < 2 && (err.name === 'AbortError' || err.message.includes('status 5') || err.message.includes('status 429'))) {
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 async function analyzeCode({ code, language, explanationLanguage = 'en' }) {
   if (!code || !code.trim()) {
     throw new Error('No code provided for analysis');
   }
 
-  const apiKey = config.ai.apiKey;
-  const model = config.ai.model || 'gemini-3.8-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-
-  const promptText = `LANGUAGE: ${language}\n\nSOURCE CODE TO ANALYZE:\n\`\`\`${language}\n${code}\n\`\`\``;
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 45000); // 45s timeout
-
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [
-          { role: 'user', parts: [{ text: `${SYSTEM_PROMPT}\n\n${promptText}` }] }
-        ],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.2
-        }
-      }),
-      signal: controller.signal
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('[AI SERVICE ERROR] Status:', response.status, errorText);
-      throw new Error(`AI service returned status ${response.status}: ${errorText.substring(0, 150)}`);
-    }
-
-    const data = await response.json();
-    const candidate = data.candidates?.[0];
-    const text = candidate?.content?.parts?.[0]?.text;
-
-    if (!text) {
-      throw new Error('AI provider returned empty response content');
-    }
-
-    // Parse and sanitize JSON
-    let parsedResult;
+  // Primary: Groq
+  if (process.env.GROQ_API_KEY) {
     try {
-      // Remove possible markdown formatting if model accidentally included it
-      const cleanJson = text.replace(/^```json\s*/, '').replace(/```\s*$/, '').trim();
-      parsedResult = JSON.parse(cleanJson);
-    } catch (parseErr) {
-      console.error('[AI JSON PARSE ERROR] Raw text was:', text);
-      throw new Error('AI provider returned malformed JSON structure');
+      return await callGroq({ code, language, explanationLanguage });
+    } catch (err) {
+      console.warn('[BACKEND GROQ FAILED, TRYING GEMINI FALLBACK]:', err.message);
     }
-
-    // Normalize result structure
-    return {
-      summary: parsedResult.summary || 'Code analysis completed.',
-      issues: Array.isArray(parsedResult.issues) ? parsedResult.issues.map(iss => ({
-        category: ['syntax', 'type', 'logic', 'runtime', 'security', 'style', 'performance'].includes(iss.category) ? iss.category : 'logic',
-        severity: ['critical', 'error', 'warning', 'info'].includes(iss.severity) ? iss.severity : 'warning',
-        line_number: parseInt(iss.line_number, 10) || 1,
-        column_number: parseInt(iss.column_number, 10) || 1,
-        message: iss.message || 'Suspicious construct detected',
-        affected_code: iss.affected_code || '',
-        explanation_en: iss.explanation_en || 'Issue observed in source code.',
-        explanation_ta: iss.explanation_ta || 'மூலக் குறியீட்டில் பிழை அல்லது சந்தேகம் காணப்படுகிறது.',
-        suggested_fix: iss.suggested_fix || 'Review and refactor this section.',
-        verification_status: 'ai_suggestion'
-      })) : [],
-      corrected_code: parsedResult.corrected_code || code,
-      teaching_notes_en: parsedResult.teaching_notes_en || 'Review the suggested changes to improve code quality.',
-      teaching_notes_ta: parsedResult.teaching_notes_ta || 'குறியீட்டின் தரத்தை மேம்படுத்த பரிந்துரைக்கப்பட்ட மாற்றங்களைச் சரிபார்க்கவும்.'
-    };
-  } catch (err) {
-    clearTimeout(timeoutId);
-    if (err.name === 'AbortError') {
-      throw new Error('AI analysis timed out after 45 seconds');
-    }
-    throw err;
   }
+
+  // Fallback: Gemini
+  if (process.env.AI_API_KEY || process.env.GEMINI_API_KEY || config.ai.apiKey) {
+    try {
+      return await callGemini({ code, language, explanationLanguage });
+    } catch (err) {
+      console.error('[BACKEND GEMINI FALLBACK FAILED]:', err.message);
+    }
+  }
+
+  throw new Error('AI analysis is temporarily unavailable. Please try again later.');
 }
 
 module.exports = {

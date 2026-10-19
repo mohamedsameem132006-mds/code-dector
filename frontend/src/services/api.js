@@ -17,8 +17,9 @@ import { db } from './firebase';
 import { detectLanguage } from '../utils/languageDetector';
 import { calculateQualityMetrics } from '../utils/metricsCalculator';
 
-const GEMINI_API_KEY = import.meta.env.VITE_AI_API_KEY || '';
-const GEMINI_MODEL = import.meta.env.VITE_AI_MODEL || 'gemini-3.8-flash';
+// Fallback client Gemini (only used if serverless backend is completely unreachable)
+const CLIENT_GEMINI_KEY = import.meta.env.VITE_AI_API_KEY || '';
+const CLIENT_GEMINI_MODEL = import.meta.env.VITE_AI_MODEL || 'gemini-2.0-flash';
 
 const SYSTEM_PROMPT = `You are CodeSense AI, an expert static analysis engine, security auditor, and master coding instructor.
 Analyze the user's submitted source code thoroughly.
@@ -53,35 +54,25 @@ CRITICAL RULES:
 4. If no errors are detected, issues can be empty ([]), corrected_code should be identical to the original, and explain in teaching notes that the code is syntactically sound.
 5. Return ONLY the JSON object. Do not wrap in markdown \`\`\`json or add conversational text.`;
 
-async function callGeminiDirect({ code, language }) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-  const promptText = `LANGUAGE: ${language}\n\nSOURCE CODE TO ANALYZE:\n\`\`\`${language}\n${code}\n\`\`\``;
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [
-        { role: 'user', parts: [{ text: `${SYSTEM_PROMPT}\n\n${promptText}` }] }
-      ],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        temperature: 0.2
-      }
-    })
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Gemini API Error (${response.status}): ${errorText.substring(0, 150)}`);
+function parseJsonFromAi(rawText, originalCode) {
+  if (!rawText || typeof rawText !== 'string') {
+    throw new Error('AI returned empty response');
   }
 
-  const data = await response.json();
-  const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!rawText) throw new Error('Empty response from AI engine');
+  let clean = rawText.trim();
+  clean = clean.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
 
-  const cleanJson = rawText.replace(/^```json\s*/, '').replace(/```\s*$/, '').trim();
-  const parsed = JSON.parse(cleanJson);
+  const firstBrace = clean.indexOf('{');
+  const lastBrace = clean.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    clean = clean.substring(firstBrace, lastBrace + 1);
+  }
+
+  const parsed = JSON.parse(clean);
 
   return {
     summary: parsed.summary || 'Code analysis completed.',
@@ -90,17 +81,137 @@ async function callGeminiDirect({ code, language }) {
       severity: ['critical', 'error', 'warning', 'info'].includes(iss.severity) ? iss.severity : 'warning',
       line_number: parseInt(iss.line_number, 10) || 1,
       column_number: parseInt(iss.column_number, 10) || 1,
-      message: iss.message || 'Suspicious construct detected',
-      affected_code: iss.affected_code || '',
-      explanation_en: iss.explanation_en || 'Issue observed in source code.',
-      explanation_ta: iss.explanation_ta || 'மூலக் குறியீட்டில் பிழை அல்லது சந்தேகம் காணப்படுகிறது.',
-      suggested_fix: iss.suggested_fix || 'Review and refactor this section.',
+      message: String(iss.message || 'Suspicious construct detected'),
+      affected_code: String(iss.affected_code || ''),
+      explanation_en: String(iss.explanation_en || 'Issue observed in source code.'),
+      explanation_ta: String(iss.explanation_ta || 'மூலக் குறியீட்டில் பிழை அல்லது சந்தேகம் காணப்படுகிறது.'),
+      suggested_fix: String(iss.suggested_fix || 'Review and refactor this section.'),
       verification_status: 'ai_suggestion'
     })) : [],
-    corrected_code: parsed.corrected_code || code,
+    corrected_code: parsed.corrected_code || originalCode,
     teaching_notes_en: parsed.teaching_notes_en || 'Review clean code principles.',
     teaching_notes_ta: parsed.teaching_notes_ta || 'குறியீட்டின் தரத்தை மேம்படுத்த பரிந்துரைக்கப்பட்ட மாற்றங்களைச் சரிபார்க்கவும்.'
   };
+}
+
+/**
+ * Call backend serverless function (Primary: Groq, Fallback: Gemini on server)
+ * Retries with exponential backoff for 429/500/502/503/504
+ */
+async function callServerlessAnalyze({ code, language, explanationLanguage }) {
+  const endpoints = ['/api/analyze', '/.netlify/functions/analyze'];
+  let lastError = null;
+
+  for (const endpoint of endpoints) {
+    const maxRetries = 2;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (attempt > 0) {
+        await delay(Math.min(1000 * Math.pow(2, attempt), 3000));
+      }
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 40000);
+
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, language, explanationLanguage }),
+          signal: controller.signal
+        });
+
+        clearTimeout(timeout);
+
+        if (response.status === 404) {
+          // Try next endpoint path
+          break;
+        }
+
+        if (response.status === 429 || (response.status >= 500 && response.status <= 504)) {
+          const errData = await response.json().catch(() => ({}));
+          lastError = new Error(errData.message || `Server returned ${response.status}`);
+          if (attempt < maxRetries) continue;
+          break;
+        }
+
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.message || `Server error (${response.status})`);
+        }
+
+        const resData = await response.json();
+        if (resData.success && resData.data) {
+          return resData.data;
+        }
+      } catch (err) {
+        clearTimeout(timeout);
+        lastError = err;
+        if (attempt < maxRetries && (err.name === 'AbortError' || err.message?.includes('50'))) {
+          continue;
+        }
+      }
+    }
+  }
+
+  throw lastError || new Error('Backend serverless function unavailable');
+}
+
+/**
+ * Direct client Gemini fallback (only activated if backend serverless function is not deployed)
+ */
+async function callDirectGeminiFallback({ code, language, explanationLanguage }) {
+  if (!CLIENT_GEMINI_KEY) {
+    throw new Error('AI analysis is temporarily unavailable. Please try again later.');
+  }
+
+  const model = CLIENT_GEMINI_MODEL;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${CLIENT_GEMINI_KEY}`;
+  const promptText = `LANGUAGE: ${language}\nTARGET EXPLANATION LANGUAGE: ${explanationLanguage === 'ta' ? 'Tamil (தமிழ்) & English' : 'English'}\n\nSOURCE CODE TO ANALYZE:\n\`\`\`${language}\n${code}\n\`\`\``;
+
+  for (let attempt = 0; attempt <= 2; attempt++) {
+    if (attempt > 0) await delay(Math.min(1000 * Math.pow(2, attempt), 3000));
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 35000);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [
+            { role: 'user', parts: [{ text: `${SYSTEM_PROMPT}\n\n${promptText}` }] }
+          ],
+          generationConfig: {
+            responseMimeType: 'application/json',
+            temperature: 0.2
+          }
+        }),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeout);
+
+      if (response.status === 503 || response.status === 429) {
+        if (attempt < 2) continue;
+        throw new Error('AI service is temporarily busy. Please retry in a few moments.');
+      }
+
+      if (!response.ok) {
+        throw new Error(`AI analysis service unavailable (${response.status})`);
+      }
+
+      const data = await response.json();
+      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      return parseJsonFromAi(rawText, code);
+    } catch (err) {
+      clearTimeout(timeout);
+      if (attempt < 2 && (err.name === 'AbortError' || err.message?.includes('503'))) continue;
+      throw err;
+    }
+  }
+
+  throw new Error('AI analysis is temporarily unavailable. Please try again later.');
 }
 
 export const apiService = {
@@ -109,20 +220,47 @@ export const apiService = {
     return {
       data: {
         status: 'ok',
-        aiModel: 'gemini-3.8-flash',
+        aiModel: 'Groq (Llama 3.3 70B) + Gemini Fallback',
         database: 'Cloud Firestore'
       }
     };
   },
 
-  // Create Analysis (Analyzes with Gemini & saves to Firestore)
+  // Create Analysis (Calls secure backend serverless function, then saves to Firestore)
   createAnalysis: async ({ code, filename, manualLanguage, explanationLanguage = 'ta' }) => {
     const detected = detectLanguage(code, filename);
     const chosenLanguage = manualLanguage || detected.language;
     const analysisId = 'analysis_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
 
-    // Call Gemini direct
-    const aiResult = await callGeminiDirect({ code, language: chosenLanguage });
+    let aiResult = null;
+
+    // 1. Try secure backend serverless function (Groq primary + Gemini server fallback)
+    try {
+      aiResult = await callServerlessAnalyze({
+        code,
+        language: chosenLanguage,
+        explanationLanguage
+      });
+    } catch (backendErr) {
+      console.warn('[SERVERLESS ANALYZE FAILED, CHECKING DIRECT FALLBACK]:', backendErr.message);
+
+      // 2. Try direct client Gemini fallback if client key exists
+      try {
+        aiResult = await callDirectGeminiFallback({
+          code,
+          language: chosenLanguage,
+          explanationLanguage
+        });
+      } catch (fallbackErr) {
+        console.error('[DIRECT FALLBACK FAILED]:', fallbackErr.message);
+        throw new Error('AI analysis is temporarily unavailable. Please try again later.');
+      }
+    }
+
+    if (!aiResult) {
+      throw new Error('AI analysis is temporarily unavailable. Please try again later.');
+    }
+
     const metrics = calculateQualityMetrics(aiResult.issues, code);
 
     const analysisData = {
@@ -284,7 +422,6 @@ export const apiService = {
     const reportId = 'rep_' + Date.now();
     const fileName = `CodeSense_Report_${language}_${Date.now()}.pdf`;
 
-    // Fetch analysis data to store record in history
     let reportData = {
       id: reportId,
       analysis_id: id,
@@ -303,12 +440,10 @@ export const apiService = {
       }
     } catch (e) {}
 
-    // Save to Firestore reports collection
     try {
       await setDoc(doc(db, 'reports', reportId), reportData);
     } catch (e) {}
 
-    // Save to local reports list
     try {
       const reports = JSON.parse(localStorage.getItem('saved_reports') || '[]');
       reports.unshift(reportData);
@@ -345,9 +480,8 @@ export const apiService = {
 
   downloadReportUrl: (reportId) => `#`,
 
-  // Client-side HTML-to-PDF generation (Captures page accurately including Tamil fonts!)
+  // Client-side HTML-to-PDF generation (Captures page accurately including Tamil fonts)
   downloadReport: async (reportId, fileName = 'CodeSense-Report.pdf') => {
-    // Generate clean client-side printable document or capture
     const mainContent = document.querySelector('main') || document.body;
     
     try {
@@ -411,7 +545,6 @@ export const apiService = {
       }
     } catch (err) {}
 
-    // Fallback to local records
     const local = collectionName === 'reports' 
       ? JSON.parse(localStorage.getItem('saved_reports') || '[]')
       : JSON.parse(localStorage.getItem('saved_analyses') || '[]');

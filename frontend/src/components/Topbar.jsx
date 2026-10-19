@@ -50,7 +50,7 @@ export default function Topbar({ title = 'Dashboard' }) {
           <span className={isDark ? 'text-slate-600' : 'text-slate-300'}>•</span>
           <span className="text-indigo-600 dark:text-indigo-400 flex items-center gap-1 font-medium">
             <Sparkles className="w-3 h-3" />
-            {health.aiModel || 'Gemini 3.8'}
+            {health.aiModel || 'Groq + Gemini'}
           </span>
         </div>
 
